@@ -1,0 +1,220 @@
+﻿name: sparse8b-phase0
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: which stage to run
+        type: choice
+        default: all
+        options: [all, calib, ppl, bench, traces, report]
+      grid:
+        description: ppl grid size
+        type: choice
+        default: core
+        options: [core, full]
+  push:
+    branches: ['ci/sparse8b-phase0']
+
+env:
+  HF_HUB_ENABLE_HF_TRANSFER: "0"
+
+defaults:
+  run:
+    working-directory: phase0
+
+jobs:
+  # ---------------- calibration ----------------
+  calib-8b:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.task == 'all' || inputs.task == 'calib' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/models
+          key: mlc-models-v1-8b-q3
+      - name: download weights
+        run: |
+          python -c "from huggingface_hub import snapshot_download as d; r='mlc-ai/Llama-3.1-8B-Instruct-q3f16_0-MLC'; d(r, local_dir='${{ github.workspace }}/models/'+r.split('/')[-1], allow_patterns=['*.json','*.bin'])"
+      - run: python calibrate.py --model 8b-q3 --models-root ${{ github.workspace }}/models --tokens 32768 --threads 4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: thresholds-8b-q3
+          path: phase0/thresholds-8b-q3.json
+
+  calib-3b:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.task == 'all' || inputs.task == 'calib' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/models
+          key: mlc-models-v1-3b-q4
+      - name: download weights
+        run: |
+          python -c "from huggingface_hub import snapshot_download as d; r='mlc-ai/Llama-3.2-3B-Instruct-q4f16_0-MLC'; d(r, local_dir='${{ github.workspace }}/models/'+r.split('/')[-1], allow_patterns=['*.json','*.bin'])"
+      - run: python calibrate.py --model 3b-q4 --models-root ${{ github.workspace }}/models --tokens 32768 --threads 4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: thresholds-3b-q4
+          path: phase0/thresholds-3b-q4.json
+
+  # ---------------- perplexity ----------------
+  ppl:
+    if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.task == 'all' || inputs.task == 'ppl') }}
+    needs: [calib-8b, calib-3b]
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        # 'block' granularity = packing-width block sparsity (what stock device weights support);
+        # one 'element' run kept as the block-cost reference. 3B sparse rows feed the M2 gate.
+        include: ${{ fromJSON( (github.event_name == 'workflow_dispatch' && inputs.grid == 'full') && '[{"model":"8b-q3","sp":0,"sel":"teal","gran":"element"},{"model":"8b-q3","sp":50,"sel":"teal","gran":"element"},{"model":"8b-q3","sp":40,"sel":"teal","gran":"block"},{"model":"8b-q3","sp":50,"sel":"teal","gran":"block"},{"model":"8b-q3","sp":50,"sel":"gate","gran":"block"},{"model":"3b-q4","sp":0,"sel":"teal","gran":"element"},{"model":"3b-q4","sp":40,"sel":"teal","gran":"block"},{"model":"3b-q4","sp":50,"sel":"teal","gran":"block"},{"model":"8b-q3","sp":40,"sel":"teal","gran":"element"},{"model":"8b-q3","sp":25,"sel":"teal","gran":"block"},{"model":"8b-q3","sp":60,"sel":"teal","gran":"block"},{"model":"8b-q3","sp":40,"sel":"gate","gran":"block"}]' || '[{"model":"8b-q3","sp":0,"sel":"teal","gran":"element"},{"model":"8b-q3","sp":50,"sel":"teal","gran":"element"},{"model":"8b-q3","sp":40,"sel":"teal","gran":"block"},{"model":"8b-q3","sp":50,"sel":"teal","gran":"block"},{"model":"8b-q3","sp":50,"sel":"gate","gran":"block"},{"model":"3b-q4","sp":0,"sel":"teal","gran":"element"},{"model":"3b-q4","sp":40,"sel":"teal","gran":"block"},{"model":"3b-q4","sp":50,"sel":"teal","gran":"block"}]' ) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/models
+          key: mlc-models-v1-${{ matrix.model }}
+      - name: download weights
+        run: |
+          python -c "from huggingface_hub import snapshot_download as d; repos={'8b-q3':'mlc-ai/Llama-3.1-8B-Instruct-q3f16_0-MLC','3b-q4':'mlc-ai/Llama-3.2-3B-Instruct-q4f16_0-MLC'}; r=repos['${{ matrix.model }}']; d(r, local_dir='${{ github.workspace }}/models/'+r.split('/')[-1], allow_patterns=['*.json','*.bin'])"
+      - uses: actions/download-artifact@v4
+        with:
+          name: thresholds-${{ matrix.model }}
+          path: phase0
+      - run: python ppl.py --model ${{ matrix.model }} --models-root ${{ github.workspace }}/models --thresholds thresholds-${{ matrix.model }}.json --sparsity ${{ matrix.sp }} --select ${{ matrix.sel }} --granularity ${{ matrix.gran }} --threads 4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ppl-${{ matrix.model }}-s${{ matrix.sp }}-${{ matrix.sel }}-${{ matrix.gran }}
+          path: phase0/ppl_*.json
+
+  # ---------------- benchmarks ----------------
+  bench:
+    if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.task == 'all' || inputs.task == 'bench') }}
+    needs: [calib-8b, calib-3b]
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {model: "8b-q3", sp: 0, sel: "teal", gran: "element"}
+          - {model: "8b-q3", sp: 50, sel: "teal", gran: "block"}
+          - {model: "8b-q3", sp: 50, sel: "gate", gran: "block"}
+          - {model: "3b-q4", sp: 0, sel: "teal", gran: "element"}
+          - {model: "3b-q4", sp: 50, sel: "teal", gran: "block"}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/models
+          key: mlc-models-v1-${{ matrix.model }}
+      - name: download weights
+        run: |
+          python -c "from huggingface_hub import snapshot_download as d; repos={'8b-q3':'mlc-ai/Llama-3.1-8B-Instruct-q3f16_0-MLC','3b-q4':'mlc-ai/Llama-3.2-3B-Instruct-q4f16_0-MLC'}; r=repos['${{ matrix.model }}']; d(r, local_dir='${{ github.workspace }}/models/'+r.split('/')[-1], allow_patterns=['*.json','*.bin'])"
+      - uses: actions/download-artifact@v4
+        with:
+          name: thresholds-${{ matrix.model }}
+          path: phase0
+      - run: python bench.py --model ${{ matrix.model }} --models-root ${{ github.workspace }}/models --thresholds thresholds-${{ matrix.model }}.json --sparsity ${{ matrix.sp }} --select ${{ matrix.sel }} --granularity ${{ matrix.gran }} --suite both --threads 4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.model }}-s${{ matrix.sp }}-${{ matrix.sel }}-${{ matrix.gran }}
+          path: phase0/bench_*.json
+
+  # ---------------- firing traces ----------------
+  traces:
+    if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.task == 'all' || inputs.task == 'traces') }}
+    needs: [calib-8b]
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/models
+          key: mlc-models-v1-8b-q3
+      - name: download weights
+        run: |
+          python -c "from huggingface_hub import snapshot_download as d; r='mlc-ai/Llama-3.1-8B-Instruct-q3f16_0-MLC'; d(r, local_dir='${{ github.workspace }}/models/'+r.split('/')[-1], allow_patterns=['*.json','*.bin'])"
+      - uses: actions/download-artifact@v4
+        with:
+          name: thresholds-8b-q3
+          path: phase0
+      - run: python traces.py --model 8b-q3 --models-root ${{ github.workspace }}/models --thresholds thresholds-8b-q3.json --sparsity 50 --select gate --shard ${{ matrix.shard }}/4 --threads 4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: traces-${{ matrix.shard }}
+          path: phase0/traces_*.npz
+
+  # ---------------- report ----------------
+  report:
+    if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.task == 'all' || inputs.task == 'report') }}
+    needs: [ppl, bench, traces]
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/models
+          key: mlc-models-v1-8b-q3
+      - name: download weights (8b for missim dims)
+        run: |
+          python -c "from huggingface_hub import snapshot_download as d; r='mlc-ai/Llama-3.1-8B-Instruct-q3f16_0-MLC'; d(r, local_dir='${{ github.workspace }}/models/'+r.split('/')[-1], allow_patterns=['*.json'])"
+      - uses: actions/download-artifact@v4
+        with:
+          path: phase0/artifacts
+          merge-multiple: true
+      - run: python missim.py --traces "artifacts/traces_*.npz" --model 8b-q3 --models-root ${{ github.workspace }}/models --out-csv artifacts/missim.csv --out-rank artifacts/hot_rank.json
+      - run: python report.py --dir artifacts --out artifacts/REPORT.md
+      - name: job summary
+        run: cat artifacts/REPORT.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: phase0-report
+          path: |
+            phase0/artifacts/REPORT.md
+            phase0/artifacts/missim.csv
+            phase0/artifacts/hot_rank.json
+
