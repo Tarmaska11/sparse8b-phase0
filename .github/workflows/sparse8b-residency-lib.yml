@@ -1,0 +1,485 @@
+﻿# sparse8b-residency-lib вЂ” build the 8B-q4 teal_residency MLC artifacts for the Clarity engine.
+#
+# Produces (artifact `residency-8b-q4`):
+#   * dist/model-lib-tars/llama_residency.tar   вЂ” the teal_residency model-kernels lib (Android)
+#   * dist/8b-q4-residency/                      вЂ” the RESIDENT weights (ndarray-cache + shards +
+#                                                  mlc-chat-config.json + tokenizer): gate_proj +
+#                                                  attention + lm_head + embed, NO up/down/gate_up
+#   * dist/clarity-ffn-bundles.bin               вЂ” the per-model FFN bundle file (up/down store)
+#   * dist/clarity-sparse.json                   вЂ” the residency sidecar (density/hot/ring/io)
+#   * all convert/compile/gen logs + MANIFEST.txt
+#
+# The runtime .so is NOT built here (model-kernels only). It is relinked LOCALLY afterward via
+# scripts/relink-mlc-from-ci.ps1 against llama_residency.tar (see research/sparse8b/M3_BUILD.md).
+#
+# TVM + mlc_llm host libs are built from the SAME pinned source as mlc-model-lib.yml and share its
+# host-build cache key, so the heavy TVM build is reused across the two workflows.
+#
+# HARD CONSTRAINT: this is the CI half. No local builds/torch/cmake happen on the laptop.
+# Trigger: workflow_dispatch or push to ci/sparse8b-residency-lib (orchestrator triggers).
+
+name: sparse8b-residency-lib
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/sparse8b-residency-lib]
+
+permissions:
+  contents: read
+
+env:
+  # MUST match mlc-model-lib.yml so the CI model kernels and the locally relinked runtime come from
+  # identical source (tvm submodule b628d91), and so the host-build cache is shared.
+  MLC_LLM_COMMIT: 2008fe8343e1f40ef89ee57b9287aebcf1b86c98
+
+jobs:
+  residency:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      # ---------------------------------------------------------------------------------------
+      # 1. Toolchain + TVM/mlc_llm host build (COPIED from mlc-model-lib.yml, same cache key).
+      # ---------------------------------------------------------------------------------------
+      - name: Checkout Clarity
+        uses: actions/checkout@v4
+
+      - name: Free runner disk space (keep android SDK вЂ” we need the NDK)
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost \
+            /usr/local/lib/node_modules /opt/hostedtoolcache/CodeQL \
+            /usr/share/swift /usr/local/.ghcup /usr/local/share/powershell || true
+          # NOTE: we KEEP the android SDK/NDK ($ANDROID_NDK_LATEST_HOME) вЂ” mlc_llm compile
+          # --device android cross-compiles the kernels with it (matches mlc-model-lib.yml).
+          df -h /
+
+      # NO swapfile here, deliberately (run 28809381625 lesson): /mnt is the SAME 72GB root disk
+      # and this job ends with only ~6.6GB disk free (16GB checkpoint) вЂ” any swapfile kills it.
+      # Convert is fine on the 7.8GB-RAM runner because the 8B ships in 4GB shards. Free docker's
+      # ~4GB instead for margin.
+      - name: Prune docker images (disk margin)
+        run: |
+          sudo docker system prune -af >/dev/null 2>&1 || true
+          free -h; df -h /
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            llvm-18-dev libpolly-18-dev libzstd-dev ccache ninja-build git-lfs
+
+      - name: Clone mlc-llm (pinned commit + submodules, shallow)
+        run: |
+          mkdir mlc-llm-src && cd mlc-llm-src
+          git init -q
+          git remote add origin https://github.com/mlc-ai/mlc-llm.git
+          git fetch --depth 1 origin "$MLC_LLM_COMMIT"
+          git checkout -q FETCH_HEAD
+          git submodule update --init --recursive --depth 1 || git submodule update --init --recursive
+
+      - name: Patch tvm Logging.cmake (tvm_libinfo_objs removed upstream)
+        run: |
+          f=mlc-llm-src/3rdparty/tvm/cmake/modules/Logging.cmake
+          grep -q 'tvm_libinfo_objs' "$f"
+          sed -i 's|^\(\s*\)target_compile_definitions(tvm_libinfo_objs PUBLIC TVM_LOG_CUSTOMIZE=1)|\1if(TARGET tvm_libinfo_objs)\n\1  target_compile_definitions(tvm_libinfo_objs PUBLIC TVM_LOG_CUSTOMIZE=1)\n\1endif()|' "$f"
+
+      - name: Patch mlc4j tvm_runtime.h (stale includes + removed InternalError)
+        run: |
+          f=mlc-llm-src/android/mlc4j/src/cpp/tvm_runtime.h
+          sed -i '\|#include <runtime/profiling.cc>|d; \|#include <runtime/source_utils.cc>|d' "$f"
+          sed -i 's|throw InternalError(file, lineno, message);|throw tvm::ffi::Error("InternalError", message, TVMFFIBacktrace(file.c_str(), lineno, "", 0));|' "$f"
+          ! grep -n 'profiling.cc\|source_utils.cc\|throw InternalError' "$f"
+
+      - name: Patch tvm kernel schedules for Mali (prefill regression) вЂ” best-effort
+        # The two committed tvm-patches (matmul.py restoring the pre-#17430 shared-memory dequant-
+        # matmul schedule + _kernel_common.py gating the Adreno attention config) live on the
+        # ci/mlc-model-lib branch under ci/tvm-patches/. They are NOT present on main. If they are
+        # present (branch merged / cherry-picked), apply them with the same sentinel guard as
+        # mlc-model-lib.yml; otherwise WARN and continue (the lib is still functionally correct, just
+        # Mali prefill is ~20x slower вЂ” a speed regression, not a correctness one).
+        run: |
+          base=mlc-llm-src/3rdparty/tvm/python/tvm
+          mm="$base/s_tir/dlight/gpu/matmul.py"
+          kc="$base/relax/frontend/nn/llm/_kernel_common.py"
+          if [ -f ci/tvm-patches/matmul.py ] && [ -f ci/tvm-patches/_kernel_common.py ]; then
+            grep -q 'block_size_y=4' "$mm" || { echo "matmul.py sentinel missing (pin drift?)"; exit 1; }
+            grep -q '("android" in str(target.host)) or ("adreno" in str(target.attrs))' "$kc" \
+              || { echo "_kernel_common.py sentinel missing (pin drift?)"; exit 1; }
+            cp ci/tvm-patches/matmul.py "$mm"
+            cp ci/tvm-patches/_kernel_common.py "$kc"
+            python3 -c "import ast; ast.parse(open('$mm').read()); ast.parse(open('$kc').read()); print('tvm-patches applied: syntax OK')"
+            grep -q 'set_scope(rmat_block, 0, \"shared\")' "$mm" || { echo "shared-mem schedule missing"; exit 1; }
+            ! grep -q 'android\" in str(target.host)' "$mm" "$kc"
+          else
+            echo "::warning::ci/tvm-patches/ not present on this branch вЂ” building WITHOUT the Mali prefill schedule fix. Prefill on Mali-G68 will be ~20x slower. Cherry-pick ci/tvm-patches from ci/mlc-model-lib to fix."
+          fi
+
+      # restore/save SPLIT (not actions/cache): plain cache@v4 saves only on JOB SUCCESS, and
+      # caches are BRANCH-scoped вЂ” every failed run on this branch rebuilt TVM from scratch
+      # (~2h) while ci/gemma4e-compile's cache sat unreachable. The explicit save step below
+      # (right after the host builds) persists the build even when a later step fails.
+      - name: Restore host builds (tvm + mlc_llm) and ccache
+        id: host-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            mlc-llm-src/3rdparty/tvm/build
+            mlc-llm-src/build
+            ~/.cache/ccache
+          key: host-build-${{ env.MLC_LLM_COMMIT }}-v1
+
+      - name: Build TVM from source (host compiler)
+        run: |
+          cd mlc-llm-src/3rdparty/tvm
+          mkdir -p build && cd build
+          cat > config.cmake <<'EOC'
+          set(CMAKE_BUILD_TYPE RelWithDebInfo)
+          set(USE_LLVM "llvm-config-18 --link-static")
+          set(HIDE_PRIVATE_SYMBOLS ON)
+          set(USE_CUDA OFF)
+          set(USE_METAL OFF)
+          set(USE_VULKAN OFF)
+          set(USE_OPENCL OFF)
+          set(USE_LIBBACKTRACE OFF)
+          set(SUMMARIZE ON)
+          EOC
+          cmake .. -G Ninja \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          ninja -j4
+          ls -la *.so || true
+
+      - name: Build mlc_llm host libs
+        run: |
+          cd mlc-llm-src
+          mkdir -p build && cd build
+          cat > config.cmake <<EOC
+          set(TVM_SOURCE_DIR $GITHUB_WORKSPACE/mlc-llm-src/3rdparty/tvm)
+          set(CMAKE_BUILD_TYPE RelWithDebInfo)
+          set(USE_CUDA OFF)
+          set(USE_METAL OFF)
+          set(USE_VULKAN OFF)
+          set(USE_OPENCL OFF)
+          set(USE_FLASHINFER OFF)
+          EOC
+          cmake .. -G Ninja \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          ninja -j4
+          ls -la *.so || true
+
+      # Persist the host builds NOW вЂ” before the fragile download/convert steps can fail the job
+      # (plain cache@v4 would only save on job success, which this branch has never had).
+      - name: Save host-build cache
+        if: steps.host-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            mlc-llm-src/3rdparty/tvm/build
+            mlc-llm-src/build
+            ~/.cache/ccache
+          key: host-build-${{ env.MLC_LLM_COMMIT }}-v1
+
+      - name: Set up source python packages
+        run: |
+          pip install --no-cache-dir mlc-llm-src/3rdparty/tvm/3rdparty/tvm-ffi
+          # NOTE: the no-torch rule applies to the LAPTOP (thermal), not CI runners.
+          # convert_weight loads safetensors via torch вЂ” CPU wheel ONLY (the default CUDA stack
+          # is ~15GB and fills the runner disk; CacheBlend lesson).
+          pip install --no-cache-dir numpy cloudpickle ml_dtypes psutil typing_extensions \
+            tornado fastapi uvicorn shortuuid pydantic requests tqdm safetensors \
+            transformers datasets pandas prompt_toolkit tiktoken openai pytest scipy \
+            huggingface_hub
+          pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+          {
+            echo "PYTHONPATH=$GITHUB_WORKSPACE/mlc-llm-src/python:$GITHUB_WORKSPACE/mlc-llm-src/3rdparty/tvm/python"
+            echo "TVM_LIBRARY_PATH=$GITHUB_WORKSPACE/mlc-llm-src/3rdparty/tvm/build"
+            echo "MLC_LIBRARY_PATH=$GITHUB_WORKSPACE/mlc-llm-src/build"
+            echo "MLC_LLM_SOURCE_DIR=$GITHUB_WORKSPACE/mlc-llm-src"
+            echo "TVM_SOURCE_DIR=$GITHUB_WORKSPACE/mlc-llm-src/3rdparty/tvm"
+          } >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------------------------------
+      # 2. Apply the Clarity teal_residency graph + loader + quantization patches into the clone.
+      # ---------------------------------------------------------------------------------------
+      - name: Apply Clarity sparse patches (graph glue + residency FFN + loader guard + sparse gemv)
+        run: |
+          set -e
+          root=mlc-llm-src/python/mlc_llm
+          src=research/sparse8b/patches/ci
+
+          # 2a. Arch-agnostic residency glue (new module) + the llama graph that uses it.
+          cp "$src/clarity_sparse_common.py" "$root/model/clarity_sparse_common.py"
+          cp "$src/llama_model.py"           "$root/model/llama/llama_model.py"
+          # 2b. Loader guard: skip gate_up fusion when the graph has no gate_up_proj (teal_residency
+          #     has only a resident gate_proj) so gate_proj maps 1:1 and up/down are dropped.
+          cp "$src/loader/standard_loader.py" "$root/loader/standard_loader.py"
+          # 2c. GroupQuantizeLinear.forward emits the sparse externs when CLARITY_SPARSE_MODE is set
+          #     (attention/gate/lm_head sparse gemv on decode/verify). Required for the residency lib.
+          cp "$src/group_quantization.py"    "$root/quantization/group_quantization.py"
+
+          # Sentinels вЂ” fail loudly if a file drifted / didn't land.
+          grep -q 'clarity_sparse'                                  "$root/model/llama/llama_model.py"
+          grep -q 'ClarityResidentFFN'                              "$root/model/clarity_sparse_common.py"
+          grep -q 'in named_parameters'                             "$root/loader/standard_loader.py"
+          grep -q 'CLARITY_SPARSE_MODE in ("teal", "teal_residency")' "$root/quantization/group_quantization.py"
+
+          # RopeMode NORMAL -> INLINE (match the shipping dense libs / mlc-model-lib). The patched
+          # llama_model.py ships NORMAL; flip it to INLINE here.
+          sed -i 's/rope_mode=RopeMode.NORMAL/rope_mode=RopeMode.INLINE/' "$root/model/llama/llama_model.py"
+          grep -q 'rope_mode=RopeMode.INLINE' "$root/model/llama/llama_model.py" || { echo "RopeMode INLINE sed failed"; exit 1; }
+
+          # ast.parse every patched file.
+          for f in "$root/model/clarity_sparse_common.py" "$root/model/llama/llama_model.py" \
+                   "$root/loader/standard_loader.py" "$root/quantization/group_quantization.py"; do
+            python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read()); print('ast OK:', sys.argv[1])" "$f"
+          done
+
+      - name: Verify source imports (after patches)
+        run: |
+          python -c "import tvm; print('tvm OK:', tvm.__file__)"
+          python -c "import mlc_llm; print('mlc_llm OK:', mlc_llm.__file__)"
+          python -c "from mlc_llm.model.clarity_sparse_common import ClarityResidentFFN; print('ClarityResidentFFN import OK')"
+
+      # ---------------------------------------------------------------------------------------
+      # 3. Fetch an UNGATED fp16 Llama-3.1-8B-Instruct (no HF token / no gate).
+      # ---------------------------------------------------------------------------------------
+      - name: Download ungated fp16 8B (NousResearch, fallback unsloth)
+        run: |
+          python - <<'PY'
+          import os
+          from huggingface_hub import snapshot_download
+          # Both are ungated fp16 safetensors mirrors of Meta-Llama-3.1-8B-Instruct.
+          # NousResearch is the canonical ungated mirror the MLC community uses; unsloth is the fallback.
+          candidates = [
+              "NousResearch/Meta-Llama-3.1-8B-Instruct",
+              "unsloth/Meta-Llama-3.1-8B-Instruct",
+          ]
+          patterns = ["*.safetensors", "*.json", "*.model", "tokenizer*", "*.txt"]
+          dest = os.path.join(os.environ["GITHUB_WORKSPACE"], "hf8b")
+          last = None
+          for repo in candidates:
+              try:
+                  print(f"[hf8b] trying {repo}", flush=True)
+                  p = snapshot_download(repo, local_dir=dest, allow_patterns=patterns)
+                  print(f"[hf8b] downloaded {repo} -> {p}", flush=True)
+                  break
+              except Exception as e:  # noqa: BLE001
+                  print(f"[hf8b] {repo} failed: {e}", flush=True)
+                  last = e
+          else:
+              raise SystemExit(f"all ungated 8B mirrors failed: {last}")
+          # sanity: must have safetensors + config.json
+          fs = [f for f in os.listdir(dest) if f.endswith(".safetensors")]
+          assert fs, f"no safetensors under {dest}: {os.listdir(dest)}"
+          assert os.path.exists(os.path.join(dest, "config.json")), "no config.json in 8B snapshot"
+          print(f"[hf8b] safetensors: {fs}")
+          PY
+          echo "HF8B=$GITHUB_WORKSPACE/hf8b" >> "$GITHUB_ENV"
+          df -h /
+
+      - name: Prepare dist dirs
+        run: |
+          mkdir -p dist/model-lib-tars dist/logs
+
+      # ---------------------------------------------------------------------------------------
+      # 4. Convert A вЂ” FULL standard q4f16_0 dir (clarity_sparse UNSET => dense graph => gate_up
+      #    fused + down present) so bundles.py can read the up-half + down_proj.
+      #    CLI (mlc-llm/python/mlc_llm/cli/convert_weight.py + gen_config.py):
+      #      positional `config` = the HF dir (its config.json, no clarity_sparse -> dense);
+      #      --source defaults to auto = config's dir = $HF8B (has the safetensors).
+      # ---------------------------------------------------------------------------------------
+      - name: Convert A вЂ” full dense q4f16_0 (for bundles.py)
+        run: |
+          set -o pipefail
+          python -m mlc_llm convert_weight "$HF8B" \
+            --quantization q4f16_0 --model-type llama \
+            --output dist/8b-q4-full 2>&1 | tee dist/logs/convertA_weight.log
+          # gen_config makes mlc-chat-config.json + copies tokenizer (bundles.py reads mlc-chat-config.json).
+          # VERIFY: conv-template llama-3 is valid (CONV_TEMPLATES in interface/gen_config.py); 3.1 also
+          # accepts llama-3_1 if a 3.1-specific template is ever wanted.
+          python -m mlc_llm gen_config "$HF8B" \
+            --quantization q4f16_0 --model-type llama --conv-template llama-3 \
+            --output dist/8b-q4-full 2>&1 | tee dist/logs/convertA_genconfig.log
+          # Assert the dense dir has the fused gate_up + down (what bundles.py slices).
+          python - <<'PY'
+          import json, os
+          # pinned MLC writes tensor-cache.json (older trees: ndarray-cache.json) вЂ” accept either
+          d = "dist/8b-q4-full"
+          cache = next(p for n in ("tensor-cache.json", "ndarray-cache.json")
+                       if os.path.isfile(p := os.path.join(d, n)))
+          nc = json.load(open(cache))
+          names = {r["name"] for r in nc["records"]}
+          has_gate_up = any("mlp.gate_up_proj" in n for n in names)
+          has_down = any("mlp.down_proj" in n for n in names)
+          assert has_gate_up and has_down, f"dense dir missing gate_up/down (gate_up={has_gate_up}, down={has_down})"
+          print("[convertA] OK: fused gate_up_proj + down_proj present")
+          PY
+
+      # ---------------------------------------------------------------------------------------
+      # 5. Bundle file вЂ” up_col (direct-copy q4) | down_row (requant q4) per neuron, clustered.
+      #    bundles.py reads dist/8b-q4-full's mlc-chat-config.json + ndarray-cache + shards (numpy only).
+      # ---------------------------------------------------------------------------------------
+      - name: Build clarity-ffn-bundles.bin
+        run: |
+          set -o pipefail
+          python phase0/bundles.py \
+            --model dist/8b-q4-full \
+            --out dist/clarity-ffn-bundles.bin \
+            --cluster 16 2>&1 | tee dist/logs/bundles.log
+          # (identity perm for v1; --firing-counts hot_rank.json optional if a phase0 trace is dropped in)
+          ls -la dist/clarity-ffn-bundles.bin dist/clarity-ffn-bundles.bin.meta.json
+
+      # ---------------------------------------------------------------------------------------
+      # 6. Convert B вЂ” teal_residency RESIDENT weights. Build a config dir whose config.json has
+      #    clarity_sparse=teal_residency (top-level; ConfigBase.from_file reads the LlamaConfig
+      #    field) so the traced graph is ClarityResidentFFN (gate_proj only). --source MUST be the
+      #    real HF dir (the config dir has no safetensors).
+      # ---------------------------------------------------------------------------------------
+      - name: Convert B вЂ” teal_residency resident weights (gate_proj, no up/down)
+        run: |
+          set -o pipefail
+          mkdir -p dist/residency-cfg
+          # config.json = HF config.json + clarity_sparse=teal_residency (top-level).
+          python - <<'PY'
+          import json, os
+          hf = os.environ["HF8B"]
+          cfg = json.load(open(os.path.join(hf, "config.json")))
+          cfg["clarity_sparse"] = "teal_residency"
+          json.dump(cfg, open("dist/residency-cfg/config.json", "w"), indent=2)
+          print("[convertB] wrote residency-cfg/config.json with clarity_sparse=teal_residency")
+          PY
+          # positional config = dist/residency-cfg (teal_residency graph); weights from $HF8B.
+          python -m mlc_llm convert_weight dist/residency-cfg \
+            --quantization q4f16_0 --model-type llama \
+            --source "$HF8B" \
+            --output dist/8b-q4-residency 2>&1 | tee dist/logs/convertB_weight.log
+          # gen_config against the real HF dir (tokenizer + config), then inject clarity_sparse
+          # TOP-LEVEL into the produced mlc-chat-config.json (compile merges top-level -> model_config,
+          # see interface/compile.py `model_config.update(config)`).
+          python -m mlc_llm gen_config "$HF8B" \
+            --quantization q4f16_0 --model-type llama --conv-template llama-3 \
+            --output dist/8b-q4-residency 2>&1 | tee dist/logs/convertB_genconfig.log
+          python - <<'PY'
+          import json
+          p = "dist/8b-q4-residency/mlc-chat-config.json"
+          cfg = json.load(open(p))
+          cfg["clarity_sparse"] = "teal_residency"          # top-level inject (PROGRESS finding #4)
+          cfg.setdefault("model_config", {})["clarity_sparse"] = "teal_residency"  # belt-and-suspenders
+          json.dump(cfg, open(p, "w"), indent=2)
+          print("[convertB] injected clarity_sparse=teal_residency top-level into mlc-chat-config.json")
+          # Assert resident weights have gate_proj and NO up/down/gate_up.
+          import os
+          d = "dist/8b-q4-residency"
+          cache = next(p for n in ("tensor-cache.json", "ndarray-cache.json")
+                       if os.path.isfile(p := os.path.join(d, n)))
+          nc = json.load(open(cache))
+          names = {r["name"] for r in nc["records"]}
+          bad = [n for n in names if ("mlp.up_proj" in n or "mlp.down_proj" in n or "mlp.gate_up_proj" in n)]
+          has_gate = any("mlp.gate_proj" in n for n in names)
+          assert has_gate, "residency dir missing mlp.gate_proj (loader/graph mismatch)"
+          assert not bad, f"residency dir unexpectedly contains up/down/gate_up: {sorted(bad)[:6]}"
+          print("[convertB] OK: gate_proj present; no up/down/gate_up")
+          PY
+
+      # ---------------------------------------------------------------------------------------
+      # 7. Residency lib вЂ” compile the teal_residency model kernels for Android.
+      #    CLI (cli/compile.py): positional model = mlc-chat-config.json; -o must be a FILE (not dir);
+      #    parent dir must exist. clarity_sparse rides in via the top-level inject above.
+      # ---------------------------------------------------------------------------------------
+      - name: Compile residency model-kernels lib (android tar)
+        run: |
+          set -o pipefail
+          export ANDROID_NDK="$ANDROID_NDK_LATEST_HOME"
+          export TVM_NDK_CC="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+          rustup target add aarch64-linux-android || true
+          python -m mlc_llm compile dist/8b-q4-residency/mlc-chat-config.json \
+            --quantization q4f16_0 --model-type llama \
+            --device android \
+            -o dist/model-lib-tars/llama_residency.tar 2>&1 | tee dist/logs/compile_residency.log
+          ls -la dist/model-lib-tars/
+
+      # ---------------------------------------------------------------------------------------
+      # 8. Sidecar вЂ” teal_residency clarity-sparse.json (density 0.40 + hot/ring/io defaults).
+      #    export_sidecar.py requires a --thresholds file with grids_block; no phase0 thresholds
+      #    artifact is wired in here, so we feed a minimal stub keyed at the 40% sparsity slot.
+      #    gate_select taus stay empty -> runtime uses its on-device histogram top-K fallback.
+      # ---------------------------------------------------------------------------------------
+      - name: Export clarity-sparse.json sidecar (teal_residency)
+        run: |
+          set -o pipefail
+          # VERIFY: drop a real thresholds-8b-q4.json (phase0 calibrate, block_k=8) here to carry
+          # per-layer gate_select taus instead of the histogram fallback.
+          python - <<'PY'
+          import json
+          json.dump({"block_k": 8, "grids_block": {"0.40": {}}},
+                    open("dist/thresholds-stub.json", "w"), indent=2)
+          print("[sidecar] wrote thresholds stub (grids_block['0.40'] empty -> histogram fallback)")
+          PY
+          python phase0/export_sidecar.py \
+            --thresholds dist/thresholds-stub.json \
+            --sparsity 40 --mode teal_residency \
+            --density 0.40 --hot-cache-gb 1.05 --ring-gb 0.25 --io-budget-clusters 24 \
+            --out dist/clarity-sparse.json 2>&1 | tee dist/logs/sidecar.log
+          cat dist/clarity-sparse.json
+
+      - name: Write MANIFEST.txt (sizes + lib hash)
+        if: always()
+        run: |
+          {
+            echo "residency-8b-q4 artifact вЂ” $(date -u +%FT%TZ)"
+            echo "MLC_LLM_COMMIT=$MLC_LLM_COMMIT"
+            echo
+            echo "== model-lib tar =="
+            if [ -f dist/model-lib-tars/llama_residency.tar ]; then
+              sha256sum dist/model-lib-tars/llama_residency.tar
+              ls -la dist/model-lib-tars/llama_residency.tar
+            else
+              echo "MISSING llama_residency.tar (compile step failed вЂ” see logs)"
+            fi
+            echo
+            echo "== bundle file =="
+            ls -la dist/clarity-ffn-bundles.bin dist/clarity-ffn-bundles.bin.meta.json 2>/dev/null || echo "MISSING bundles"
+            echo
+            echo "== residency weights dir =="
+            ls -la dist/8b-q4-residency 2>/dev/null || echo "MISSING residency dir"
+            du -sh dist/8b-q4-residency 2>/dev/null || true
+            echo
+            echo "== sidecar =="
+            cat dist/clarity-sparse.json 2>/dev/null || echo "MISSING sidecar"
+          } | tee dist/MANIFEST.txt
+
+      # ---------------------------------------------------------------------------------------
+      # 9. Upload вЂ” if: always() so logs survive a mid-pipeline failure.
+      # ---------------------------------------------------------------------------------------
+      - name: Upload residency-8b-q4 artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: residency-8b-q4
+          retention-days: 30
+          if-no-files-found: warn
+          path: |
+            dist/model-lib-tars/*.tar
+            dist/8b-q4-residency/tensor-cache.json
+            dist/8b-q4-residency/ndarray-cache.json
+            dist/8b-q4-residency/params_shard_*.bin
+            dist/8b-q4-residency/mlc-chat-config.json
+            dist/8b-q4-residency/tokenizer*
+            dist/8b-q4-residency/*.json
+            dist/clarity-ffn-bundles.bin
+            dist/clarity-ffn-bundles.bin.meta.json
+            dist/clarity-sparse.json
+            dist/MANIFEST.txt
+            dist/logs/*.log
+
