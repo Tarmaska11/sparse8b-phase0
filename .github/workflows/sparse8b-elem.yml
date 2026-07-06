@@ -1,0 +1,89 @@
+name: sparse8b-elem
+# De-risk M3 before building the residency/bundle engine: does ELEMENT-granular sparsity preserve
+# the 8B-q4 quality advantage (dense ppl 6.93 vs 3B-q4 8.80), and which FFN selection rule works?
+#   - element-TEAL (magnitude threshold on each matmul's true input, incl. down = silu(gate)*up)
+#   - gate-select (|silu(gate)|>tau, the cheap residency rule) — run 1 showed this ~garbage on q3
+# Target to beat: 3b-q4 dense overall ppl 8.80. If 8b-q4 element-TEAL@50 stays well under that,
+# the residency path is worth building. Runs on the public mirror (push ci/sparse8b-elem).
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: ['ci/sparse8b-elem']
+
+defaults:
+  run:
+    working-directory: phase0
+
+jobs:
+  calib:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11', cache: pip}
+      - run: pip install -r requirements.txt
+      - uses: actions/cache@v4
+        with: {path: '${{ github.workspace }}/models', key: mlc-models-v1-8b-q4}
+      - name: download 8b-q4
+        run: |
+          python -c "from huggingface_hub import snapshot_download as d; r='mlc-ai/Llama-3.1-8B-Instruct-q4f16_1-MLC'; d(r, local_dir='${{ github.workspace }}/models/'+r.split('/')[-1], allow_patterns=['*.json','*.bin'])"
+      - run: python calibrate.py --model 8b-q4 --models-root ${{ github.workspace }}/models --tokens 32768 --threads 4
+      - uses: actions/upload-artifact@v4
+        with: {name: thresholds-8b-q4, path: phase0/thresholds-8b-q4.json}
+
+  ppl:
+    needs: calib
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {sp: 25, sel: teal, gran: element}
+          - {sp: 40, sel: teal, gran: element}
+          - {sp: 50, sel: teal, gran: element}
+          - {sp: 40, sel: gate, gran: element}
+          - {sp: 50, sel: gate, gran: element}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11', cache: pip}
+      - run: pip install -r requirements.txt
+      - uses: actions/cache@v4
+        with: {path: '${{ github.workspace }}/models', key: mlc-models-v1-8b-q4}
+      - name: download 8b-q4
+        run: |
+          python -c "from huggingface_hub import snapshot_download as d; r='mlc-ai/Llama-3.1-8B-Instruct-q4f16_1-MLC'; d(r, local_dir='${{ github.workspace }}/models/'+r.split('/')[-1], allow_patterns=['*.json','*.bin'])"
+      - uses: actions/download-artifact@v4
+        with: {name: thresholds-8b-q4, path: phase0}
+      - run: python ppl.py --model 8b-q4 --models-root ${{ github.workspace }}/models --thresholds thresholds-8b-q4.json --sparsity ${{ matrix.sp }} --select ${{ matrix.sel }} --granularity ${{ matrix.gran }} --threads 4
+      - uses: actions/upload-artifact@v4
+        with: {name: elem-ppl-s${{ matrix.sp }}-${{ matrix.sel }}, path: phase0/ppl_*.json}
+
+  bench:
+    needs: calib
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {sp: 40, sel: teal, gran: element}
+          - {sp: 50, sel: teal, gran: element}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11', cache: pip}
+      - run: pip install -r requirements.txt
+      - uses: actions/cache@v4
+        with: {path: '${{ github.workspace }}/models', key: mlc-models-v1-8b-q4}
+      - name: download 8b-q4
+        run: |
+          python -c "from huggingface_hub import snapshot_download as d; r='mlc-ai/Llama-3.1-8B-Instruct-q4f16_1-MLC'; d(r, local_dir='${{ github.workspace }}/models/'+r.split('/')[-1], allow_patterns=['*.json','*.bin'])"
+      - uses: actions/download-artifact@v4
+        with: {name: thresholds-8b-q4, path: phase0}
+      - run: python bench.py --model 8b-q4 --models-root ${{ github.workspace }}/models --thresholds thresholds-8b-q4.json --sparsity ${{ matrix.sp }} --select ${{ matrix.sel }} --granularity ${{ matrix.gran }} --suite both --threads 4
+      - uses: actions/upload-artifact@v4
+        with: {name: elem-bench-s${{ matrix.sp }}-${{ matrix.sel }}, path: phase0/bench_*.json}
