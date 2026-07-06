@@ -1,0 +1,73 @@
+﻿name: sparse8b-predictor
+# M2.5 feasibility: can a SMALL input-conditional predictor rank FFN neurons so that
+# reading only the top-K predicted captures most of the down-proj magnitude?
+# collect (one forward -> per-layer h_in/|mid| shards) -> train (low-rank predictors,
+# magnitude/firing recall vs a static hot-set baseline). Decides whether 8B-q4 residency
+# is viable (a high magnitude-recall at low density = cold up+down reads are skippable).
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: ['ci/sparse8b-predictor']
+
+defaults:
+  run:
+    working-directory: phase0
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11', cache: pip}
+      - run: pip install -r requirements.txt
+      - uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/models
+          key: mlc-models-v1-8b-q4
+      - name: download 8b-q4
+        run: |
+          python -c "from huggingface_hub import snapshot_download as d; r='mlc-ai/Llama-3.1-8B-Instruct-q4f16_1-MLC'; d(r, local_dir='${{ github.workspace }}/models/'+r.split('/')[-1], allow_patterns=['*.json','*.bin'])"
+      - name: calibrate (down thresholds -> tau)
+        run: python calibrate.py --model 8b-q4 --models-root ${{ github.workspace }}/models --tokens 32768 --threads 4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: thresholds-8b-q4
+          path: phase0/thresholds-8b-q4.json
+          retention-days: 5
+      - name: collect FFN (h_in,|mid|) pairs
+        run: python predictor.py collect --model 8b-q4 --models-root ${{ github.workspace }}/models --layers 0,8,16,24,31 --tokens 8192 --seq-len 512 --threads 4 --out ffn_pairs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ffn-pairs-8b-q4
+          path: phase0/ffn_pairs
+          retention-days: 5
+
+  train:
+    needs: collect
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11', cache: pip}
+      - run: pip install -r requirements.txt
+      - uses: actions/download-artifact@v4
+        with:
+          name: ffn-pairs-8b-q4
+          path: phase0/ffn_pairs
+      - uses: actions/download-artifact@v4
+        with:
+          name: thresholds-8b-q4
+          path: phase0
+      - name: train + eval predictors
+        run: python predictor.py train --data ffn_pairs --layers 0,8,16,24,31 --predictors lowrank64,lowrank128,lowrank256,linear --thresholds thresholds-8b-q4.json --firing-sparsity 0.50 --epochs 8 --linear-epochs 2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: predictor-report-8b-q4
+          path: |
+            phase0/predictor_report_8b-q4.json
+            phase0/REPORT.md
+
